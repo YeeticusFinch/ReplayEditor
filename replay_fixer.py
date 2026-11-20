@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import math
-import os
 import shutil
-import tempfile
 import tkinter as tk
 import zipfile
 from dataclasses import dataclass
@@ -25,7 +22,7 @@ MAX_CONNECTORS = 200
 class ReplayData:
     source: Path
     source_is_archive: bool
-    archive_entries: list[tuple[zipfile.ZipInfo, bytes]]
+    archive_entries: list[zipfile.ZipInfo]
     timelines: dict[str, list[dict[str, Any]]]
     metadata: dict[str, Any]
     original_text: str
@@ -50,7 +47,8 @@ def _read_replay(path: Path) -> ReplayData:
         timeline_bytes = archive.read(timeline_name)
         metadata_name = next((name for name in names if name == "metaData.json" or name.endswith("/metaData.json")), None)
         metadata = json.loads(archive.read(metadata_name).decode("utf-8")) if metadata_name else {}
-        entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
+        # Keep only member metadata in memory; replay packet streams can be very large.
+        entries = list(archive.infolist())
     text = timeline_bytes.decode("utf-8")
     parsed = json.loads(text)
     if timeline_name != "timelines.json":
@@ -70,9 +68,13 @@ def _write_replay_as(data: ReplayData, destination: Path) -> None:
     if data.source_is_archive:
         destination.parent.mkdir(parents=True, exist_ok=True)
         member = getattr(data, "timeline_member", "timelines.json")
-        with zipfile.ZipFile(destination, "w") as output:
-            for info, contents in data.archive_entries:
-                output.writestr(info, encoded if info.filename == member else contents)
+        with zipfile.ZipFile(data.source, "r") as source_archive, zipfile.ZipFile(destination, "w") as output:
+            for info in data.archive_entries:
+                if info.filename == member:
+                    output.writestr(info, encoded)
+                else:
+                    with source_archive.open(info, "r") as source, output.open(info, "w") as target:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
         return
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -109,7 +111,8 @@ class TimelineEditor(tk.Tk):
         filebar = ttk.Frame(self, padding=(8, 8, 8, 4))
         filebar.pack(fill="x")
         ttk.Button(filebar, text="Open Replay…", command=self.open_replay).pack(side="left")
-        ttk.Button(filebar, text="Save As…", command=self.save_as).pack(side="left", padx=(6, 12))
+        ttk.Button(filebar, text="Open Folder…", command=self.open_folder).pack(side="left", padx=(5, 0))
+        ttk.Button(filebar, text="Save As…", command=self.save_as).pack(side="left", padx=(5, 12))
         ttk.Label(filebar, text="Path:").pack(side="left")
         self.path_combo = ttk.Combobox(filebar, state="readonly", width=24)
         self.path_combo.pack(side="left", padx=5)
@@ -188,12 +191,20 @@ class TimelineEditor(tk.Tk):
             filetypes=(("Replay archives", "*.mcpr *.zip"), ("All files", "*.*")),
         )
         if not choice:
-            folder = filedialog.askdirectory(title="Or select an extracted replay folder")
-            if not folder:
-                return
-            choice = folder
+            return
+        self._load_replay(Path(choice))
+
+    def open_folder(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Open extracted ReplayMod folder",
+            initialdir=str(DEFAULT_RECORDINGS if DEFAULT_RECORDINGS.exists() else Path.home()),
+        )
+        if folder:
+            self._load_replay(Path(folder))
+
+    def _load_replay(self, path: Path) -> None:
         try:
-            self.data = _read_replay(Path(choice))
+            self.data = _read_replay(path)
             self._validate_schema()
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
             self.data = None
@@ -357,7 +368,10 @@ class TimelineEditor(tk.Tk):
                 key_x = self._x_for("keyframe", float(frame["time"]))
                 # The connector terminates at the upper edge of this panel, directly
                 # beneath the corresponding point in the independently scaled Replay Timeline.
-                canvas.create_line(key_x, upper - 5, replay_x, 0, fill="#e55353", width=1)
+                replay_left = self.replay_canvas.canvasx(0)
+                keyframe_left = canvas.canvasx(0)
+                replay_aligned_x = replay_x - replay_left + keyframe_left
+                canvas.create_line(key_x, upper - 5, replay_aligned_x, 0, fill="#e55353", width=1)
 
         selected_ids = {id(frame) for _kind, frame in ([self.selected] if self.selected else [])}
         bulk_ids = self.bulk_selected
@@ -409,7 +423,7 @@ class TimelineEditor(tk.Tk):
         canvas = getattr(self, f"{kind}_canvas")
         old_width = max(1.0, self._world_width(kind))
         center = canvas.canvasx(canvas.winfo_width() / 2) / old_width
-        setattr(self, f"{kind}_zoom", min(100.0, max(0.08, getattr(self, f"{kind}_zoom") * factor)))
+        setattr(self, f"{kind}_zoom", min(100.0, max(1.0, getattr(self, f"{kind}_zoom") * factor)))
         self.redraw()
         self.update_idletasks()
         new_width = max(1.0, self._world_width(kind))
@@ -431,8 +445,9 @@ class TimelineEditor(tk.Tk):
             if not frames:
                 return
             frame = min(frames, key=lambda item: abs(float(item.get("time", 0)) - target_ms))
-            if abs(float(frame.get("time", 0)) - target_ms) <= 18000:
-                self._select_keyframe(kkind, frame)
+            tolerance_ms = 10 / self._scale_for("keyframe") * 1000
+            if abs(float(frame.get("time", 0)) - target_ms) <= tolerance_ms:
+                self._select_keyframe(kkind, frame, alignment_x=event.x)
             return
         timestamp = x / self._scale_for("replay") * 1000.0
         if not self.time_frames:
@@ -441,11 +456,12 @@ class TimelineEditor(tk.Tk):
         self._select_keyframe("time", frame)
         self._scroll_keyframe_to(float(frame.get("time", 0)))
 
-    def _scroll_replay_to(self, timestamp: float) -> None:
+    def _scroll_replay_to(self, timestamp: float, screen_x: float | None = None) -> None:
         canvas = self.replay_canvas
         width = max(1, self._world_width("replay"))
         x = self._x_for("replay", timestamp)
-        canvas.xview_moveto(max(0, min(1, (x - canvas.winfo_width() / 2) / width)))
+        screen_x = canvas.winfo_width() / 2 if screen_x is None else screen_x
+        canvas.xview_moveto(max(0, min(1, (x - screen_x) / width)))
 
     def _scroll_keyframe_to(self, timestamp: float) -> None:
         canvas = self.keyframe_canvas
@@ -453,9 +469,9 @@ class TimelineEditor(tk.Tk):
         x = self._x_for("keyframe", timestamp)
         canvas.xview_moveto(max(0, min(1, (x - canvas.winfo_width() / 2) / width)))
 
-    def _select_keyframe(self, kind: str, frame: dict[str, Any]) -> None:
+    def _select_keyframe(self, kind: str, frame: dict[str, Any], alignment_x: float | None = None) -> None:
         self.selected = (kind, frame)
-        self._scroll_replay_to(self._frame_replay_time(kind, frame))
+        self._scroll_replay_to(self._frame_replay_time(kind, frame), alignment_x)
         self._populate_editor()
         self.redraw()
 
@@ -629,12 +645,15 @@ class TimelineEditor(tk.Tk):
                 messagebox.showerror("Choose another file", "Save As must use a different file from the original.", parent=self)
                 return
         else:
-            destination = filedialog.askdirectory(title="Choose a new folder for the edited replay")
-            if not destination:
+            parent = filedialog.askdirectory(title="Choose where to create the edited replay folder")
+            if not parent:
                 return
-            dest = Path(destination)
+            dest = Path(parent) / f"{self.data.source.name}_edited"
             if dest.resolve() == self.data.source.resolve():
                 messagebox.showerror("Choose another folder", "Save As must use a different folder from the original.", parent=self)
+                return
+            if dest.exists():
+                messagebox.showerror("Folder already exists", f"Choose another parent folder; this output already exists:\n{dest}", parent=self)
                 return
         try:
             _write_replay_as(self.data, dest)
