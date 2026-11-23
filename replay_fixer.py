@@ -324,9 +324,14 @@ class TimelineEditor(tk.Tk):
             x = self._x_for("replay", timestamp)
             if x > width:
                 continue
-            color = "#ff6060" if frame is self.problematic else "#88b5ff"
-            canvas.create_line(x, y - 12, x, y + 12, fill=color, width=2 if frame is self.selected and self.selected[1] is frame else 1)
+            selected = self.selected is not None and self.selected[1] is frame
+            color = "#fff06a" if selected else "#ff6060" if frame is self.problematic else "#88b5ff"
+            canvas.create_line(x, y - 12, x, y + 12, fill=color, width=2 if selected or frame is self.problematic else 1)
             canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline=color, tags=(f"replay-{index}",))
+        if self.selected is not None and self.selected[0] == "position":
+            selected_replay_x = self._x_for("replay", self._frame_replay_time("position", self.selected[1]))
+            canvas.create_line(selected_replay_x, y - 12, selected_replay_x, y + 12, fill="#fff06a", width=2)
+            canvas.create_oval(selected_replay_x - 3, y - 3, selected_replay_x + 3, y + 3, fill="#fff06a", outline="#fff06a")
         canvas.create_text(8, 5, anchor="nw", fill="#d9e0e9", text=f"0 — {self._format_time(duration)}")
 
     def _visible_keyframe_range(self) -> tuple[float, float]:
@@ -385,7 +390,7 @@ class TimelineEditor(tk.Tk):
                 x = self._x_for("keyframe", t)
                 chosen = id(frame) in selected_ids
                 broken = frame is self.problematic
-                color = "#ff5555" if broken else "#fff06a" if chosen else "#63dc72"
+                color = "#fff06a" if chosen else "#ff5555" if broken else "#63dc72"
                 if id(frame) in bulk_ids and not chosen and not broken:
                     color = "#54d9d0"
                 canvas.create_text(x, y, text=symbol, fill=color, font=("Segoe UI", 17, "bold"), tags=(f"kf-{kind}-{index}",))
@@ -447,21 +452,19 @@ class TimelineEditor(tk.Tk):
             frame = min(frames, key=lambda item: abs(float(item.get("time", 0)) - target_ms))
             tolerance_ms = 10 / self._scale_for("keyframe") * 1000
             if abs(float(frame.get("time", 0)) - target_ms) <= tolerance_ms:
-                self._select_keyframe(kkind, frame, alignment_x=event.x)
+                self._select_keyframe(kkind, frame)
             return
         timestamp = x / self._scale_for("replay") * 1000.0
         if not self.time_frames:
             return
         frame = min(self.time_frames, key=lambda item: abs(float(item.get("properties", {}).get("timestamp", 0)) - timestamp))
         self._select_keyframe("time", frame)
-        self._scroll_keyframe_to(float(frame.get("time", 0)))
 
-    def _scroll_replay_to(self, timestamp: float, screen_x: float | None = None) -> None:
+    def _scroll_replay_to(self, timestamp: float) -> None:
         canvas = self.replay_canvas
         width = max(1, self._world_width("replay"))
         x = self._x_for("replay", timestamp)
-        screen_x = canvas.winfo_width() / 2 if screen_x is None else screen_x
-        canvas.xview_moveto(max(0, min(1, (x - screen_x) / width)))
+        canvas.xview_moveto(max(0, min(1, (x - canvas.winfo_width() / 2) / width)))
 
     def _scroll_keyframe_to(self, timestamp: float) -> None:
         canvas = self.keyframe_canvas
@@ -469,9 +472,10 @@ class TimelineEditor(tk.Tk):
         x = self._x_for("keyframe", timestamp)
         canvas.xview_moveto(max(0, min(1, (x - canvas.winfo_width() / 2) / width)))
 
-    def _select_keyframe(self, kind: str, frame: dict[str, Any], alignment_x: float | None = None) -> None:
+    def _select_keyframe(self, kind: str, frame: dict[str, Any]) -> None:
         self.selected = (kind, frame)
-        self._scroll_replay_to(self._frame_replay_time(kind, frame), alignment_x)
+        self._scroll_replay_to(self._frame_replay_time(kind, frame))
+        self._scroll_keyframe_to(float(frame.get("time", 0)))
         self._populate_editor()
         self.redraw()
 
