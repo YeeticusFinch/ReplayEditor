@@ -14,8 +14,8 @@ Use **Open Replay…** to choose an `.mcpr`/`.zip` file or **Open Folder…** to
 
 ## Features
 
-- Independent zoom and horizontal scrolling for Replay and Keyframe Timelines.
-- Position keyframes (`o`) and Time Keyframes (`I`) with connectors to replay time when at most 200 keyframes are visible.
+- Independent zoom and horizontal scrolling for Replay and Keyframe Timelines; switch the Keyframe Timeline between its 10-minute view and the full keyframe range.
+- Position keyframes (`o`) and Time Keyframes (`I`) with red overlay connectors across both timelines when at most 200 keyframes are visible.
 - Click a keyframe to select/edit it; the replay view scrolls to the matching replay time.
 - Find the first Time Keyframe that travels backwards.
 - Select a keyframe-time range and shift or scale those keyframe positions around the start, midpoint, or end. This does not change replay timestamps.

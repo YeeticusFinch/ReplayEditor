@@ -102,9 +102,13 @@ class TimelineEditor(tk.Tk):
         self.selected: tuple[str, dict[str, Any]] | None = None
         self.problematic: dict[str, Any] | None = None
         self.bulk_selected: set[int] = set()
+        self.show_full_keyframe_timeline = tk.BooleanVar(value=False)
+        self.connector_overlay: tk.Toplevel | None = None
+        self.connector_canvas: tk.Canvas | None = None
         self._suppress_path_event = False
         self._editor_vars: dict[str, tk.StringVar] = {}
         self._build_ui()
+        self._create_connector_overlay()
         self._show_empty_state()
 
     def _build_ui(self) -> None:
@@ -166,11 +170,18 @@ class TimelineEditor(tk.Tk):
         ttk.Button(controls, text="−", width=3, command=lambda: self.zoom(kind, 0.75)).pack(side="left")
         ttk.Button(controls, text="+", width=3, command=lambda: self.zoom(kind, 1.33)).pack(side="left", padx=(3, 8))
         ttk.Label(controls, text="Drag scrollbar or Shift+mouse wheel to scroll horizontally").pack(side="left")
+        if kind == "keyframe":
+            ttk.Checkbutton(
+                controls,
+                text="Show entire keyframe timeline",
+                variable=self.show_full_keyframe_timeline,
+                command=self._toggle_keyframe_range,
+            ).pack(side="right", padx=(8, 2))
         canvas = tk.Canvas(section, height=88 if kind == "replay" else 104, background="#20242b", highlightthickness=0)
         canvas.pack(fill="x", expand=True, pady=(3, 0))
         scrollbar = ttk.Scrollbar(section, orient="horizontal", command=canvas.xview)
         scrollbar.pack(fill="x")
-        canvas.configure(xscrollcommand=scrollbar.set)
+        canvas.configure(xscrollcommand=lambda first, last, k=kind: self._xscroll_changed(k, first, last))
         canvas.bind("<Button-1>", lambda event, k=kind: self._timeline_click(k, event))
         canvas.bind("<MouseWheel>", lambda event, k=kind: self._wheel_zoom(k, event))
         canvas.bind("<Configure>", lambda _event: self.redraw())
@@ -183,6 +194,79 @@ class TimelineEditor(tk.Tk):
         self.replay_canvas.create_text(20, 34, anchor="w", fill="#bdc5d2", text="Open an extracted replay folder or .mcpr archive to begin.")
         self.keyframe_canvas.create_text(20, 45, anchor="w", fill="#bdc5d2", text="Keyframe tracks will appear here.")
         self._clear_editor("Select a keyframe to edit its properties.")
+
+    def _create_connector_overlay(self) -> None:
+        """Create a transparent, click-through layer for cross-timeline connectors."""
+        transparent = "#010203"
+        try:
+            overlay = tk.Toplevel(self)
+            overlay.overrideredirect(True)
+            overlay.configure(background=transparent)
+            overlay.wm_attributes("-transparentcolor", transparent)
+            canvas = tk.Canvas(overlay, background=transparent, highlightthickness=0, borderwidth=0)
+            canvas.pack(fill="both", expand=True)
+            self.connector_overlay = overlay
+            self.connector_canvas = canvas
+            self.timeline_frame.bind("<Configure>", lambda _event: self._schedule_connector_update(), add="+")
+            self.bind("<Configure>", self._root_configured, add="+")
+            self.after_idle(self._update_connector_overlay)
+        except tk.TclError:
+            # Keep the editor usable on Tk platforms without transparent windows.
+            if self.connector_overlay is not None:
+                self.connector_overlay.destroy()
+            self.connector_overlay = None
+            self.connector_canvas = None
+
+    def _root_configured(self, event: tk.Event[Any]) -> None:
+        if event.widget is self:
+            self._schedule_connector_update()
+
+    def _schedule_connector_update(self) -> None:
+        if self.connector_overlay is not None:
+            self.after_idle(self._update_connector_overlay)
+
+    def _xscroll_changed(self, kind: str, first: str, last: str) -> None:
+        getattr(self, f"{kind}_scrollbar").set(first, last)
+        self._schedule_connector_update()
+
+    def _update_connector_overlay(self) -> None:
+        overlay = self.connector_overlay
+        connector_canvas = self.connector_canvas
+        if overlay is None or connector_canvas is None or not overlay.winfo_exists():
+            return
+        frame = self.timeline_frame
+        width = max(1, frame.winfo_width())
+        height = max(1, frame.winfo_height())
+        x0, y0 = frame.winfo_rootx(), frame.winfo_rooty()
+        overlay.geometry(f"{width}x{height}+{x0}+{y0}")
+        overlay.lift()
+        connector_canvas.configure(width=width, height=height)
+        connector_canvas.delete("all")
+        if self.data is None:
+            return
+
+        low, high = self._visible_keyframe_range()
+        visible = [
+            (kind, frame_data)
+            for kind, frames in (("position", self.position_frames), ("time", self.time_frames))
+            for frame_data in frames
+            if low <= float(frame_data.get("time", 0)) <= high
+        ]
+        if len(visible) > MAX_CONNECTORS:
+            return
+
+        replay_canvas = self.replay_canvas
+        keyframe_canvas = self.keyframe_canvas
+        replay_origin_x = replay_canvas.winfo_rootx() - x0 - replay_canvas.canvasx(0)
+        keyframe_origin_x = keyframe_canvas.winfo_rootx() - x0 - keyframe_canvas.canvasx(0)
+        replay_origin_y = replay_canvas.winfo_rooty() - y0
+        keyframe_origin_y = keyframe_canvas.winfo_rooty() - y0
+        replay_y = replay_origin_y + replay_canvas.winfo_height() // 2
+        for kind, frame_data in visible:
+            keyframe_x = keyframe_origin_x + self._x_for("keyframe", float(frame_data["time"]))
+            keyframe_y = keyframe_origin_y + (32 if kind == "position" else 75)
+            replay_x = replay_origin_x + self._x_for("replay", self._frame_replay_time(kind, frame_data))
+            connector_canvas.create_line(keyframe_x, keyframe_y, replay_x, replay_y, fill="#e55353", width=1)
 
     def open_replay(self) -> None:
         choice = filedialog.askopenfilename(
@@ -220,6 +304,7 @@ class TimelineEditor(tk.Tk):
         self.path_combo.current(0)
         self._suppress_path_event = False
         self.path_name = names[0]
+        self.show_full_keyframe_timeline.set(False)
         self.selected = None
         self.problematic = None
         self.bulk_selected.clear()
@@ -281,12 +366,45 @@ class TimelineEditor(tk.Tk):
         if kind == "replay":
             span_ms = self._replay_duration()
         else:
-            span_ms = KEYFRAME_DURATION_MS
+            span_ms = self._keyframe_duration()
         return (width / (span_ms / 1000.0)) * zoom
 
     def _world_width(self, kind: str) -> float:
-        span = self._replay_duration() if kind == "replay" else KEYFRAME_DURATION_MS
+        span = self._replay_duration() if kind == "replay" else self._keyframe_duration()
         return max(getattr(self, f"{kind}_canvas").winfo_width(), (span / 1000.0) * self._scale_for(kind))
+
+    def _keyframe_duration(self) -> float:
+        if not self.show_full_keyframe_timeline.get():
+            return float(KEYFRAME_DURATION_MS)
+        maximum = max(
+            (float(frame.get("time", 0)) for frame in self.time_frames + self.position_frames),
+            default=0.0,
+        )
+        return max(float(KEYFRAME_DURATION_MS), maximum)
+
+    def _toggle_keyframe_range(self) -> None:
+        self._update_keyframe_range_title()
+        self.redraw()
+        if self.selected is not None:
+            self._scroll_keyframe_to(float(self.selected[1].get("time", 0)))
+            self.redraw()
+
+    def _update_keyframe_range_title(self) -> None:
+        if not hasattr(self, "keyframe_section"):
+            return
+        if self.show_full_keyframe_timeline.get():
+            title = f"Keyframe Timeline (full range: {self._format_time(self._keyframe_duration())})"
+        else:
+            title = "Keyframe Timeline (10 minutes)"
+        self.keyframe_section.configure(text=title)
+
+    def _ensure_selected_keyframe_in_range(self) -> None:
+        if self.selected is None or self.show_full_keyframe_timeline.get():
+            return
+        if float(self.selected[1].get("time", 0)) > KEYFRAME_DURATION_MS:
+            self.show_full_keyframe_timeline.set(True)
+            self._update_keyframe_range_title()
+            self.redraw()
 
     def _x_for(self, kind: str, milliseconds: float) -> float:
         return max(0.0, milliseconds / 1000.0 * self._scale_for(kind))
@@ -301,8 +419,10 @@ class TimelineEditor(tk.Tk):
         if self.data is None:
             self._show_empty_state()
             return
+        self._update_keyframe_range_title()
         self._draw_replay()
         self._draw_keyframes()
+        self._schedule_connector_update()
 
     def _draw_replay(self) -> None:
         canvas = self.replay_canvas
@@ -352,8 +472,9 @@ class TimelineEditor(tk.Tk):
         canvas.create_line(0, lower, width, lower, fill="#697381")
         canvas.create_text(6, 7, anchor="nw", fill="#bac4d2", text="Position")
         canvas.create_text(6, 51, anchor="nw", fill="#bac4d2", text="Time")
-        tick_ms = 30000
-        for tick in range(0, KEYFRAME_DURATION_MS + 1, tick_ms):
+        duration = self._keyframe_duration()
+        tick_ms = 30000 if duration <= KEYFRAME_DURATION_MS else 120000
+        for tick in range(0, int(duration) + 1, tick_ms):
             x = self._x_for("keyframe", tick)
             canvas.create_line(x, upper - 4, x, lower + 4, fill="#3b424c")
             canvas.create_text(x + 3, height - 16, anchor="nw", fill="#8e99a7", text=self._format_time(tick))
@@ -366,18 +487,6 @@ class TimelineEditor(tk.Tk):
                 if low <= t <= high:
                     visible.append((kind, frame))
         draw_connectors = len(visible) <= MAX_CONNECTORS
-        if draw_connectors:
-            for kind, frame in visible:
-                replay_time = self._frame_replay_time(kind, frame)
-                replay_x = self._x_for("replay", replay_time)
-                key_x = self._x_for("keyframe", float(frame["time"]))
-                # The connector terminates at the upper edge of this panel, directly
-                # beneath the corresponding point in the independently scaled Replay Timeline.
-                replay_left = self.replay_canvas.canvasx(0)
-                keyframe_left = canvas.canvasx(0)
-                replay_aligned_x = replay_x - replay_left + keyframe_left
-                canvas.create_line(key_x, upper - 5, replay_aligned_x, 0, fill="#e55353", width=1)
-
         selected_ids = {id(frame) for _kind, frame in ([self.selected] if self.selected else [])}
         bulk_ids = self.bulk_selected
         for kind, frames in (("position", self.position_frames), ("time", self.time_frames)):
@@ -396,7 +505,7 @@ class TimelineEditor(tk.Tk):
                 canvas.create_text(x, y, text=symbol, fill=color, font=("Segoe UI", 17, "bold"), tags=(f"kf-{kind}-{index}",))
         if not draw_connectors:
             canvas.create_text(width - 8, 5, anchor="ne", fill="#d7a66b", text=f"{len(visible)} visible keyframes — connectors hidden")
-        canvas.create_text(width - 8, height - 16, anchor="ne", fill="#9ca7b5", text="10:00")
+        canvas.create_text(width - 8, height - 16, anchor="ne", fill="#9ca7b5", text=self._format_time(duration))
 
     def _frame_replay_time(self, kind: str, frame: dict[str, Any]) -> float:
         if kind == "time":
@@ -460,20 +569,38 @@ class TimelineEditor(tk.Tk):
         frame = min(self.time_frames, key=lambda item: abs(float(item.get("properties", {}).get("timestamp", 0)) - timestamp))
         self._select_keyframe("time", frame)
 
+    def _center_timeline(self, kind: str, timestamp: float) -> None:
+        canvas = getattr(self, f"{kind}_canvas")
+        span = self._replay_duration() if kind == "replay" else self._keyframe_duration()
+        base_width = max(500, canvas.winfo_width())
+        viewport_width = canvas.winfo_width()
+        fraction = max(0.0, min(1.0, timestamp / span))
+
+        # At the fit-to-window zoom, a marker near either end cannot be centered
+        # because there is not enough scrollable space. Zoom in just enough to
+        # center it while preserving the current zoom when it is already sufficient.
+        if 0.0 < fraction < 1.0 and viewport_width > 0:
+            half_view = viewport_width / (2 * base_width)
+            required_zoom = max(half_view / fraction, half_view / (1 - fraction)) * 1.02
+            zoom = getattr(self, f"{kind}_zoom")
+            if zoom < required_zoom:
+                setattr(self, f"{kind}_zoom", min(100.0, required_zoom))
+                self.redraw()
+
+        width = max(1, self._world_width(kind))
+        x = self._x_for(kind, timestamp)
+        left = max(0.0, min(width - viewport_width, x - viewport_width / 2))
+        canvas.xview_moveto(left / width)
+
     def _scroll_replay_to(self, timestamp: float) -> None:
-        canvas = self.replay_canvas
-        width = max(1, self._world_width("replay"))
-        x = self._x_for("replay", timestamp)
-        canvas.xview_moveto(max(0, min(1, (x - canvas.winfo_width() / 2) / width)))
+        self._center_timeline("replay", timestamp)
 
     def _scroll_keyframe_to(self, timestamp: float) -> None:
-        canvas = self.keyframe_canvas
-        width = max(1, self._world_width("keyframe"))
-        x = self._x_for("keyframe", timestamp)
-        canvas.xview_moveto(max(0, min(1, (x - canvas.winfo_width() / 2) / width)))
+        self._center_timeline("keyframe", timestamp)
 
     def _select_keyframe(self, kind: str, frame: dict[str, Any]) -> None:
         self.selected = (kind, frame)
+        self._ensure_selected_keyframe_in_range()
         self._scroll_replay_to(self._frame_replay_time(kind, frame))
         self._scroll_keyframe_to(float(frame.get("time", 0)))
         self._populate_editor()
@@ -497,15 +624,20 @@ class TimelineEditor(tk.Tk):
         if self.selected is None:
             return
         kind, frame = self.selected
+        timeline_position = float(frame.get("time", 0))
+        ttk.Label(
+            self.editor_content,
+            text=f"Keyframe Timeline position: {self._format_time(timeline_position)} ({timeline_position:,.0f} ms)",
+        ).pack(anchor="w", pady=(0, 4))
         row = ttk.Frame(self.editor_content)
         row.pack(fill="x")
-        self._entry(row, "Keyframe time (ms)", frame.get("time", 0), "time", 0)
+        self._entry(row, "Position (ms)", frame.get("time", 0), "time", 0)
         props = frame.setdefault("properties", {})
         if kind == "time":
             self._entry(row, "Replay timestamp (ms)", props.get("timestamp", 0), "timestamp", 1)
             prior = self._previous_time_frame(frame)
-            previous_value = "—" if prior is None else str(prior.get("properties", {}).get("timestamp", "—"))
-            ttk.Label(row, text="Previous time (ms):").grid(row=0, column=4, padx=(0, 3), sticky="e")
+            previous_value = "—" if prior is None else f"{float(prior.get('properties', {}).get('timestamp', 0)):,.0f}"
+            ttk.Label(row, text="Previous Replay timestamp (ms):").grid(row=0, column=4, padx=(0, 3), sticky="e")
             ttk.Label(row, text=previous_value, width=12).grid(row=0, column=5, padx=(0, 10), sticky="w")
         else:
             pos = list(props.get("camera:position", [0, 0, 0]))
@@ -542,6 +674,7 @@ class TimelineEditor(tk.Tk):
         except (KeyError, ValueError) as exc:
             messagebox.showerror("Invalid value", f"Enter a valid number for every field.\n{exc}", parent=self)
             return
+        self._ensure_selected_keyframe_in_range()
         self._populate_editor()
         self.redraw()
 
@@ -572,7 +705,13 @@ class TimelineEditor(tk.Tk):
             timestamp = float(frame.get("properties", {}).get("timestamp", 0))
             if previous is not None and timestamp < previous:
                 self.problematic = frame
-                self.validation_label.configure(text=f"First backwards timestamp: keyframe at {self._format_time(float(frame.get('time', 0)))}")
+                self.validation_label.configure(
+                    text=(
+                        f"Backwards at {self._format_time(float(frame.get('time', 0)))}: "
+                        f"{timestamp:,.0f} ms < previous {previous:,.0f} ms; "
+                        f"set timestamp to at least {previous:,.0f} ms."
+                    )
+                )
                 self._select_keyframe("time", frame)
                 return
             previous = timestamp
@@ -606,6 +745,7 @@ class TimelineEditor(tk.Tk):
             return
         for frame in frames:
             frame["time"] = self._number(str(float(frame["time"]) + amount))
+        self._ensure_selected_keyframe_in_range()
         self._refresh_after_bulk()
 
     def apply_scale(self) -> None:
@@ -624,6 +764,7 @@ class TimelineEditor(tk.Tk):
         pivot = {"start": start, "midpoint": (start + end) / 2, "end": end}[self.pivot.get()]
         for frame in frames:
             frame["time"] = self._number(str(pivot + (float(frame["time"]) - pivot) * factor))
+        self._ensure_selected_keyframe_in_range()
         self._refresh_after_bulk()
 
     def _refresh_after_bulk(self) -> None:
