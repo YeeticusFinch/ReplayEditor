@@ -22,13 +22,15 @@ Create a standalone Python GUI for inspecting, repairing, and saving ReplayMod t
    - Draw a Replay Timeline and a Keyframe Timeline with independent horizontal scrolling and zoom.
    - Show the Keyframe Timeline's 10-minute span, with position keyframes (`o`) on the upper half and time keyframes (`I`) on the lower half.
    - Draw thin red connectors from visible keyframes to their Replay Timeline timestamps when no more than 200 keyframes are visible.
+   - Provide a force-render checkbox for connector lines above the default 200-keyframe limit.
    - Clicking a keyframe selects it and scrolls the Replay Timeline to its corresponding replay time.
 
 4. **Editing and repair tools**
    - Edit and delete selected Time Keyframes; show the previous Time Keyframe timestamp read-only.
    - Edit and delete selected Position Keyframes, including all three position and rotation values.
+   - Delete the selected keyframe with the keyboard Delete key, and delete a bulk-selected range.
    - Find and highlight the first Time Keyframe whose replay timestamp is earlier than its predecessor.
-   - Select a range of keyframes and shift or scale their Keyframe Timeline positions, with start, midpoint, or end as the scale pivot. Bulk operations do not change replay timestamps.
+   - Set bulk range endpoints by choosing Select Start / Select End and clicking keyframe markers, then shift, scale, or delete the inclusive range. Scaling supports start, midpoint, or end pivots. Bulk position operations do not change replay timestamps.
 
 5. **Verification**
    - Check Python syntax and run core checks against the supplied `timelines.json` example.

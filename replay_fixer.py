@@ -10,6 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -102,13 +103,16 @@ class TimelineEditor(tk.Tk):
         self.selected: tuple[str, dict[str, Any]] | None = None
         self.problematic: dict[str, Any] | None = None
         self.bulk_selected: set[int] = set()
+        self.bulk_pick_mode: str | None = None
         self.show_full_keyframe_timeline = tk.BooleanVar(value=False)
+        self.force_connectors = tk.BooleanVar(value=False)
         self.connector_overlay: tk.Toplevel | None = None
         self.connector_canvas: tk.Canvas | None = None
         self._suppress_path_event = False
         self._editor_vars: dict[str, tk.StringVar] = {}
         self._build_ui()
         self._create_connector_overlay()
+        self.bind("<Delete>", self._delete_key_event, add="+")
         self._show_empty_state()
 
     def _build_ui(self) -> None:
@@ -139,23 +143,29 @@ class TimelineEditor(tk.Tk):
         bulk.pack(fill="x", padx=8, pady=(0, 5))
         ttk.Label(bulk, text="Start (ms)").grid(row=0, column=0, sticky="w")
         self.bulk_start = tk.StringVar(value="0")
-        ttk.Entry(bulk, textvariable=self.bulk_start, width=11).grid(row=0, column=1, padx=(4, 10))
-        ttk.Label(bulk, text="End (ms)").grid(row=0, column=2, sticky="w")
+        ttk.Entry(bulk, textvariable=self.bulk_start, width=11).grid(row=0, column=1, padx=(4, 5))
+        self.bulk_start_button = ttk.Button(bulk, text="Select Start", command=lambda: self._begin_bulk_endpoint_pick("start"))
+        self.bulk_start_button.grid(row=0, column=2, padx=(0, 8))
+        ttk.Label(bulk, text="End (ms)").grid(row=0, column=3, sticky="w")
         self.bulk_end = tk.StringVar(value="0")
-        ttk.Entry(bulk, textvariable=self.bulk_end, width=11).grid(row=0, column=3, padx=(4, 10))
-        ttk.Button(bulk, text="Select range", command=self.select_bulk_range).grid(row=0, column=4, padx=(0, 12))
-        ttk.Label(bulk, text="Shift by (ms)").grid(row=0, column=5, sticky="w")
+        ttk.Entry(bulk, textvariable=self.bulk_end, width=11).grid(row=0, column=4, padx=(4, 5))
+        self.bulk_end_button = ttk.Button(bulk, text="Select End", command=lambda: self._begin_bulk_endpoint_pick("end"))
+        self.bulk_end_button.grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(bulk, text="Select range", command=self.select_bulk_range).grid(row=0, column=6, padx=(0, 6))
+        self.bulk_delete_button = ttk.Button(bulk, text="Delete selected", command=self.delete_bulk_selection)
+        self.bulk_delete_button.grid(row=0, column=7, padx=(0, 10))
+        ttk.Label(bulk, text="Shift by (ms)").grid(row=0, column=8, sticky="w")
         self.shift_amount = tk.StringVar(value="0")
-        ttk.Entry(bulk, textvariable=self.shift_amount, width=9).grid(row=0, column=6, padx=(4, 6))
-        ttk.Button(bulk, text="Shift", command=self.apply_shift).grid(row=0, column=7, padx=(0, 10))
-        ttk.Label(bulk, text="Scale ×").grid(row=0, column=8, sticky="w")
+        ttk.Entry(bulk, textvariable=self.shift_amount, width=9).grid(row=0, column=9, padx=(4, 5))
+        ttk.Button(bulk, text="Shift", command=self.apply_shift).grid(row=0, column=10, padx=(0, 8))
+        ttk.Label(bulk, text="Scale ×").grid(row=0, column=11, sticky="w")
         self.scale_factor = tk.StringVar(value="1.0")
-        ttk.Entry(bulk, textvariable=self.scale_factor, width=8).grid(row=0, column=9, padx=(4, 6))
+        ttk.Entry(bulk, textvariable=self.scale_factor, width=8).grid(row=0, column=12, padx=(4, 5))
         self.pivot = tk.StringVar(value="midpoint")
-        ttk.Combobox(bulk, textvariable=self.pivot, state="readonly", values=("start", "midpoint", "end"), width=10).grid(row=0, column=10, padx=(0, 6))
-        ttk.Button(bulk, text="Scale", command=self.apply_scale).grid(row=0, column=11)
+        ttk.Combobox(bulk, textvariable=self.pivot, state="readonly", values=("start", "midpoint", "end"), width=9).grid(row=0, column=13, padx=(0, 5))
+        ttk.Button(bulk, text="Scale", command=self.apply_scale).grid(row=0, column=14)
         self.bulk_label = ttk.Label(bulk, text="No keyframes selected")
-        self.bulk_label.grid(row=1, column=0, columnspan=12, sticky="w", pady=(5, 0))
+        self.bulk_label.grid(row=1, column=0, columnspan=15, sticky="w", pady=(5, 0))
 
         self.editor = ttk.LabelFrame(self, text="Selected keyframe", padding=8)
         self.editor.pack(fill="x", padx=8, pady=(0, 8))
@@ -176,6 +186,12 @@ class TimelineEditor(tk.Tk):
                 text="Show entire keyframe timeline",
                 variable=self.show_full_keyframe_timeline,
                 command=self._toggle_keyframe_range,
+            ).pack(side="right", padx=(8, 2))
+            ttk.Checkbutton(
+                controls,
+                text="Force connectors (>200)",
+                variable=self.force_connectors,
+                command=self.redraw,
             ).pack(side="right", padx=(8, 2))
         canvas = tk.Canvas(section, height=88 if kind == "replay" else 104, background="#20242b", highlightthickness=0)
         canvas.pack(fill="x", expand=True, pady=(3, 0))
@@ -205,6 +221,7 @@ class TimelineEditor(tk.Tk):
             overlay.wm_attributes("-transparentcolor", transparent)
             canvas = tk.Canvas(overlay, background=transparent, highlightthickness=0, borderwidth=0)
             canvas.pack(fill="both", expand=True)
+            canvas.bind("<Button-1>", self._connector_overlay_click)
             self.connector_overlay = overlay
             self.connector_canvas = canvas
             self.timeline_frame.bind("<Configure>", lambda _event: self._schedule_connector_update(), add="+")
@@ -220,6 +237,16 @@ class TimelineEditor(tk.Tk):
     def _root_configured(self, event: tk.Event[Any]) -> None:
         if event.widget is self:
             self._schedule_connector_update()
+
+    def _connector_overlay_click(self, event: tk.Event[Any]) -> str:
+        for kind in ("replay", "keyframe"):
+            canvas = getattr(self, f"{kind}_canvas")
+            left, top = canvas.winfo_rootx(), canvas.winfo_rooty()
+            x, y = event.x_root - left, event.y_root - top
+            if 0 <= x < canvas.winfo_width() and 0 <= y < canvas.winfo_height():
+                self._timeline_click(kind, SimpleNamespace(x=x, y=y))
+                return "break"
+        return "break"
 
     def _schedule_connector_update(self) -> None:
         if self.connector_overlay is not None:
@@ -252,7 +279,7 @@ class TimelineEditor(tk.Tk):
             for frame_data in frames
             if low <= float(frame_data.get("time", 0)) <= high
         ]
-        if len(visible) > MAX_CONNECTORS:
+        if len(visible) > MAX_CONNECTORS and not self.force_connectors.get():
             return
 
         replay_canvas = self.replay_canvas
@@ -308,6 +335,9 @@ class TimelineEditor(tk.Tk):
         self.selected = None
         self.problematic = None
         self.bulk_selected.clear()
+        self.bulk_pick_mode = None
+        self.bulk_start_button.configure(text="Select Start")
+        self.bulk_end_button.configure(text="Select End")
         self.file_label.configure(text=str(self.data.source))
         self.validation_label.configure(text="")
         self.bulk_label.configure(text="No keyframes selected")
@@ -338,6 +368,9 @@ class TimelineEditor(tk.Tk):
         self.selected = None
         self.problematic = None
         self.bulk_selected.clear()
+        self.bulk_pick_mode = None
+        self.bulk_start_button.configure(text="Select Start")
+        self.bulk_end_button.configure(text="Select End")
         self._clear_editor("Select a keyframe to edit its properties.")
         self.redraw()
 
@@ -486,7 +519,7 @@ class TimelineEditor(tk.Tk):
                 t = float(frame.get("time", 0))
                 if low <= t <= high:
                     visible.append((kind, frame))
-        draw_connectors = len(visible) <= MAX_CONNECTORS
+        draw_connectors = len(visible) <= MAX_CONNECTORS or self.force_connectors.get()
         selected_ids = {id(frame) for _kind, frame in ([self.selected] if self.selected else [])}
         bulk_ids = self.bulk_selected
         for kind, frames in (("position", self.position_frames), ("time", self.time_frames)):
@@ -505,6 +538,8 @@ class TimelineEditor(tk.Tk):
                 canvas.create_text(x, y, text=symbol, fill=color, font=("Segoe UI", 17, "bold"), tags=(f"kf-{kind}-{index}",))
         if not draw_connectors:
             canvas.create_text(width - 8, 5, anchor="ne", fill="#d7a66b", text=f"{len(visible)} visible keyframes — connectors hidden")
+        elif len(visible) > MAX_CONNECTORS:
+            canvas.create_text(width - 8, 5, anchor="ne", fill="#d7a66b", text=f"Force-rendering {len(visible)} connectors")
         canvas.create_text(width - 8, height - 16, anchor="ne", fill="#9ca7b5", text=self._format_time(duration))
 
     def _frame_replay_time(self, kind: str, frame: dict[str, Any]) -> float:
@@ -550,7 +585,33 @@ class TimelineEditor(tk.Tk):
 
     def _timeline_click(self, kind: str, event: tk.Event[Any]) -> None:
         canvas = getattr(self, f"{kind}_canvas")
+        canvas.focus_set()
         x = canvas.canvasx(event.x)
+        if self.bulk_pick_mode is not None:
+            if kind == "keyframe":
+                target_ms = x / self._scale_for("keyframe") * 1000.0
+                frames = self.position_frames if event.y < 52 else self.time_frames
+                if not frames:
+                    return
+                frame = min(frames, key=lambda item: abs(float(item.get("time", 0)) - target_ms))
+                tolerance_ms = 10 / self._scale_for("keyframe") * 1000
+                if abs(float(frame.get("time", 0)) - target_ms) <= tolerance_ms:
+                    self._set_bulk_endpoint(frame)
+                else:
+                    self.bulk_label.configure(text="Click directly on a keyframe marker to set this endpoint.")
+                return
+            if self.time_frames:
+                timestamp = x / self._scale_for("replay") * 1000.0
+                frame = min(
+                    self.time_frames,
+                    key=lambda item: abs(float(item.get("properties", {}).get("timestamp", 0)) - timestamp),
+                )
+                replay_keyframe_time = float(frame.get("properties", {}).get("timestamp", 0))
+                if abs(replay_keyframe_time - timestamp) <= 10 / self._scale_for("replay") * 1000:
+                    self._set_bulk_endpoint(frame)
+                else:
+                    self.bulk_label.configure(text="Click directly on a keyframe marker to set this endpoint.")
+            return
         if kind == "keyframe":
             target_ms = x / self._scale_for(kind) * 1000.0
             y = event.y
@@ -689,12 +750,74 @@ class TimelineEditor(tk.Tk):
         if self.selected is None:
             return
         kind, frame = self.selected
-        frames = self.time_frames if kind == "time" else self.position_frames
-        frames.remove(frame)
+        deleted_id = id(frame)
+        self._remove_keyframes({deleted_id})
         self.selected = None
         self.problematic = None if self.problematic is frame else self.problematic
-        self.bulk_selected.discard(id(frame))
+        self.bulk_selected.discard(deleted_id)
         self._clear_editor("Select a keyframe to edit its properties.")
+        self.redraw()
+
+    def _delete_key_event(self, event: tk.Event[Any]) -> str | None:
+        if self.selected is None or isinstance(
+            event.widget,
+            (tk.Entry, tk.Text, ttk.Entry, ttk.Spinbox, ttk.Combobox),
+        ):
+            return None
+        self.delete_selected()
+        return "break"
+
+    def _remove_keyframes(self, frame_ids: set[int]) -> int:
+        deleted = 0
+        for track in self.tracks[:2]:
+            old_frames = track.get("keyframes", [])
+            kept_indices = [index for index, frame in enumerate(old_frames) if id(frame) not in frame_ids]
+            deleted += len(old_frames) - len(kept_indices)
+            segments = track.get("segments")
+            if isinstance(segments, list) and len(segments) == max(0, len(old_frames) - 1):
+                track["segments"] = [segments[left] for left, _right in zip(kept_indices, kept_indices[1:])]
+            track["keyframes"] = [old_frames[index] for index in kept_indices]
+        return deleted
+
+    def _begin_bulk_endpoint_pick(self, endpoint: str) -> None:
+        if self.data is None:
+            return
+        self.bulk_pick_mode = endpoint
+        self.bulk_selected.clear()
+        self.bulk_start_button.configure(text="Click start…" if endpoint == "start" else "Select Start")
+        self.bulk_end_button.configure(text="Click end…" if endpoint == "end" else "Select End")
+        self.bulk_label.configure(text=f"Click a keyframe marker on the Keyframe Timeline to set the {endpoint}.")
+        self.redraw()
+
+    def _set_bulk_endpoint(self, frame: dict[str, Any]) -> None:
+        if self.bulk_pick_mode is None:
+            return
+        endpoint = self.bulk_pick_mode
+        value = float(frame.get("time", 0))
+        variable = self.bulk_start if endpoint == "start" else self.bulk_end
+        variable.set(f"{value:g}")
+        self.bulk_pick_mode = None
+        self.bulk_start_button.configure(text="Select Start")
+        self.bulk_end_button.configure(text="Select End")
+        self.bulk_label.configure(
+            text=f"{endpoint.title()} set to {value:,.0f} ms. Set the other endpoint, then select the range."
+        )
+
+    def delete_bulk_selection(self) -> None:
+        frames = self._bulk_frames()
+        if not frames:
+            self.bulk_label.configure(text="No keyframes selected to delete.")
+            return
+        deleted_ids = {id(frame) for frame in frames}
+        deleted = self._remove_keyframes(deleted_ids)
+        if self.selected is not None and id(self.selected[1]) in deleted_ids:
+            self.selected = None
+            self._clear_editor("Select a keyframe to edit its properties.")
+        if self.problematic is not None and id(self.problematic) in deleted_ids:
+            self.problematic = None
+            self.validation_label.configure(text="")
+        self.bulk_selected.clear()
+        self.bulk_label.configure(text=f"Deleted {deleted} keyframes.")
         self.redraw()
 
     def find_backwards(self) -> None:
@@ -719,6 +842,9 @@ class TimelineEditor(tk.Tk):
         self.redraw()
 
     def select_bulk_range(self) -> None:
+        self.bulk_pick_mode = None
+        self.bulk_start_button.configure(text="Select Start")
+        self.bulk_end_button.configure(text="Select End")
         try:
             start, end = sorted((float(self.bulk_start.get()), float(self.bulk_end.get())))
         except ValueError:
