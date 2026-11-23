@@ -4,11 +4,14 @@ A small interactive Python GUI for viewing and repairing ReplayMod timeline data
 
 ## Run
 
-Requires Python 3.10+ with Tkinter (included with standard Windows Python installations). No third-party packages are required.
+Requires Python 3.10+ with Tkinter (included with standard Windows Python installations). The optional camera preview additionally requires Node.js 18+ and the first-time setup below.
 
 ```powershell
+npm install
 python replay_fixer.py
 ```
+
+The preview decoder currently targets the supplied Minecraft 1.21 recordings (protocol 767). Enable **Camera preview** to open the separate preview window. The first use scans the replay in the background and caches visible entities and low-resolution block frames; subsequent previews load from that cache. Blocks are shown as flat-shaded raycast faces rather than textured Minecraft models. Entity markers behind blocks are hidden, and custom names are preferred over entity types. Use **Render entity models** to show simple cube-based player, zombie, and skeleton models instead of their markers.
 
 Use **Open Replay…** to choose an `.mcpr`/`.zip` file or **Open Folder…** to choose an extracted replay folder. Pick a named camera path from the Path menu when the replay has multiple paths.
 
@@ -17,6 +20,7 @@ Use **Open Replay…** to choose an `.mcpr`/`.zip` file or **Open Folder…** to
 - Independent zoom and horizontal scrolling for Replay and Keyframe Timelines; switch the Keyframe Timeline between its 10-minute view and the full keyframe range.
 - Position keyframes (`o`) and Time Keyframes (`I`) with red overlay connectors across both timelines when at most 200 keyframes are visible.
 - Click a keyframe to select/edit it; the replay view scrolls to the matching replay time.
+- Optional camera preview showing visible block faces plus markers for players and entities inside the selected camera frame.
 - Force connector rendering above the 200-keyframe default limit when needed.
 - Delete the selected keyframe with the Delete key; set bulk range endpoints by clicking **Select Start** / **Select End**, then select and delete the range.
 - Find the first Time Keyframe that travels backwards.

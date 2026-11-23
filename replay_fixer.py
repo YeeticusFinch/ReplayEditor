@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import shutil
+import threading
 import tkinter as tk
 import zipfile
 from dataclasses import dataclass
@@ -12,6 +14,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from types import SimpleNamespace
 from typing import Any
+
+from replay_preview import load_preview_data, project_camera_point, project_player
 
 
 DEFAULT_RECORDINGS = Path.home() / "AppData/Roaming/PrismLauncher/instances/1.21/minecraft/replay_recordings"
@@ -108,12 +112,26 @@ class TimelineEditor(tk.Tk):
         self.force_connectors = tk.BooleanVar(value=False)
         self.connector_overlay: tk.Toplevel | None = None
         self.connector_canvas: tk.Canvas | None = None
+        self.preview_enabled = tk.BooleanVar(value=False)
+        self.preview_window: tk.Toplevel | None = None
+        self.preview_canvas: tk.Canvas | None = None
+        self.render_entity_models = tk.BooleanVar(value=False)
+        self.preview_scenes: dict[str, dict[str, Any]] = {}
+        self.preview_entities_by_frame: dict[str, list[dict[str, Any]]] = {}
+        self.preview_data_loaded = False
+        self.preview_photo: tk.PhotoImage | None = None
+        self.preview_target_signature = ""
+        self.preview_error = ""
+        self.preview_loading = False
+        self.preview_queue: queue.Queue[tuple[int, dict[str, Any] | None, str]] = queue.Queue()
+        self.preview_load_token = 0
         self._suppress_path_event = False
         self._editor_vars: dict[str, tk.StringVar] = {}
         self._build_ui()
         self._create_connector_overlay()
         self.bind("<Delete>", self._delete_key_event, add="+")
         self._show_empty_state()
+        self.after(100, self._poll_preview_results)
 
     def _build_ui(self) -> None:
         filebar = ttk.Frame(self, padding=(8, 8, 8, 4))
@@ -133,6 +151,12 @@ class TimelineEditor(tk.Tk):
         ttk.Button(self.validation_bar, text="Find first backwards time keyframe", command=self.find_backwards).pack(side="left")
         self.validation_label = ttk.Label(self.validation_bar, text="")
         self.validation_label.pack(side="left", padx=10)
+        ttk.Checkbutton(
+            self.validation_bar,
+            text="Camera preview",
+            variable=self.preview_enabled,
+            command=self._toggle_preview,
+        ).pack(side="right")
 
         self.timeline_frame = ttk.Frame(self, padding=(8, 0, 8, 4))
         self.timeline_frame.pack(fill="both", expand=True)
@@ -341,11 +365,21 @@ class TimelineEditor(tk.Tk):
         self.file_label.configure(text=str(self.data.source))
         self.validation_label.configure(text="")
         self.bulk_label.configure(text="No keyframes selected")
+        self.preview_load_token += 1
+        self.preview_scenes = {}
+        self.preview_entities_by_frame = {}
+        self.preview_data_loaded = False
+        self.preview_photo = None
+        self.preview_target_signature = ""
+        self.preview_error = ""
+        self.preview_loading = False
         self._clear_editor("Select a keyframe to edit its properties.")
         for kind in ("replay", "keyframe"):
             setattr(self, f"{kind}_zoom", 1.0)
             getattr(self, f"{kind}_canvas").xview_moveto(0)
         self.redraw()
+        if self.preview_enabled.get():
+            self._ensure_preview_loaded()
 
     def _validate_schema(self) -> None:
         assert self.data is not None
@@ -456,6 +490,347 @@ class TimelineEditor(tk.Tk):
         self._draw_replay()
         self._draw_keyframes()
         self._schedule_connector_update()
+        if self.preview_enabled.get():
+            self._ensure_preview_loaded()
+            self._redraw_camera_preview()
+
+    def _toggle_preview(self) -> None:
+        if self.preview_enabled.get():
+            if self.preview_window is None or not self.preview_window.winfo_exists():
+                self.preview_window = tk.Toplevel(self)
+                self.preview_window.title("Camera Preview")
+                self.preview_window.geometry("720x440")
+                self.preview_window.minsize(420, 280)
+                self.preview_window.protocol("WM_DELETE_WINDOW", self._close_preview_window)
+                controls = ttk.Frame(self.preview_window, padding=(8, 6, 8, 2))
+                controls.pack(fill="x")
+                ttk.Checkbutton(
+                    controls,
+                    text="Render entity models",
+                    variable=self.render_entity_models,
+                    command=self._redraw_camera_preview,
+                ).pack(side="left")
+                self.preview_canvas = tk.Canvas(
+                    self.preview_window,
+                    background="#10151c",
+                    highlightthickness=0,
+                )
+                self.preview_canvas.pack(fill="both", expand=True, padx=8, pady=8)
+                self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_camera_preview())
+            self.preview_window.deiconify()
+            self.preview_window.lift()
+            self.preview_error = ""
+            self._ensure_preview_loaded()
+            self._redraw_camera_preview()
+        elif self.preview_window is not None and self.preview_window.winfo_exists():
+            self.preview_window.withdraw()
+
+    def _close_preview_window(self) -> None:
+        self.preview_enabled.set(False)
+        if self.preview_window is not None and self.preview_window.winfo_exists():
+            self.preview_window.withdraw()
+
+    def _ensure_preview_loaded(self) -> None:
+        if self.data is None:
+            return
+        targets = self._preview_targets()
+        target_signature = json.dumps(targets, separators=(",", ":"), sort_keys=True)
+        if target_signature == self.preview_target_signature and (
+            self.preview_data_loaded or self.preview_loading or self.preview_error
+        ):
+            return
+        self.preview_load_token += 1
+        self.preview_scenes = {}
+        self.preview_entities_by_frame = {}
+        self.preview_data_loaded = False
+        self.preview_loading = False
+        self.preview_target_signature = target_signature
+        protocol = self.data.metadata.get("protocol", 767)
+        if str(protocol) != "767":
+            self.preview_error = f"This preview currently supports Minecraft 1.21 only (replay protocol {protocol})."
+            self._redraw_camera_preview()
+            return
+        self.preview_loading = True
+        self.preview_error = ""
+        token = self.preview_load_token
+        source = self.data.source
+
+        def worker() -> None:
+            try:
+                preview_data = load_preview_data(source, targets)
+                self.preview_queue.put((token, preview_data, ""))
+            except Exception as exc:
+                self.preview_queue.put((token, None, str(exc)))
+
+        threading.Thread(target=worker, name="Replay preview index", daemon=True).start()
+        self._redraw_camera_preview()
+
+    def _poll_preview_results(self) -> None:
+        try:
+            while True:
+                token, preview_data, error = self.preview_queue.get_nowait()
+                if token != self.preview_load_token:
+                    continue
+                self.preview_loading = False
+                if preview_data is None:
+                    self.preview_error = error
+                else:
+                    self.preview_entities_by_frame = preview_data["entities"]
+                    self.preview_scenes = preview_data["scenes"]
+                    self.preview_data_loaded = True
+                    self.preview_error = ""
+                if self.preview_enabled.get():
+                    self._redraw_camera_preview()
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_preview_results)
+
+    def _preview_targets(self) -> list[dict[str, Any]]:
+        targets: list[dict[str, Any]] = []
+        for index, frame in enumerate(self.position_frames):
+            props = frame.get("properties", {})
+            position = props.get("camera:position", [0, 0, 0])
+            rotation = props.get("camera:rotation", [0, 0, 0])
+            try:
+                camera_position = [float(position[i]) for i in range(3)]
+                camera_rotation = [float(rotation[i]) for i in range(3)]
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in camera_position + camera_rotation):
+                continue
+            targets.append(
+                {
+                    "key": str(index),
+                    "t": self._frame_replay_time("position", frame),
+                    "position": camera_position,
+                    "rotation": camera_rotation,
+                }
+            )
+        return targets
+
+    def _preview_camera(self) -> tuple[tuple[float, float, float], tuple[float, float, float], float, str] | None:
+        if self.data is None or not self.position_frames:
+            return None
+        frame: dict[str, Any] | None = None
+        timestamp = 0.0
+        if self.selected is not None:
+            kind, selected_frame = self.selected
+            timestamp = self._frame_replay_time(kind, selected_frame)
+            if kind == "position":
+                frame = selected_frame
+                frame_index = next((i for i, item in enumerate(self.position_frames) if item is frame), 0)
+            else:
+                frame_index = min(
+                    range(len(self.position_frames)),
+                    key=lambda i: abs(self._frame_replay_time("position", self.position_frames[i]) - timestamp),
+                )
+                frame = self.position_frames[frame_index]
+        else:
+            frame = self.position_frames[0]
+            frame_index = 0
+            timestamp = self._frame_replay_time("position", frame)
+        props = frame.get("properties", {})
+        position = props.get("camera:position", [0, 0, 0])
+        rotation = props.get("camera:rotation", [0, 0, 0])
+        if not isinstance(position, (list, tuple)) or not isinstance(rotation, (list, tuple)):
+            return None
+        try:
+            camera_position = tuple(float(position[index]) for index in range(3))
+            camera_rotation = tuple(float(rotation[index]) for index in range(3))
+        except (IndexError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in camera_position + camera_rotation):
+            return None
+        return camera_position, camera_rotation, timestamp, str(frame_index)
+
+    @staticmethod
+    def _humanoid_parts(entity_type: str) -> list[tuple[float, float, float, float, float, float, str]] | None:
+        head = entity_type == "player"
+        zombie = entity_type in {"zombie", "husk", "drowned", "zombie_villager"}
+        skeleton = entity_type in {"skeleton", "stray", "wither_skeleton"}
+        if not (head or zombie or skeleton):
+            return None
+        if skeleton:
+            head_color, torso_color, arm_color, leg_color = "#ded7bc", "#c5bea5", "#c5bea5", "#b2ad9a"
+            head_size = (0.34, 0.34, 0.34)
+            torso_size = (0.26, 0.62, 0.16)
+            arm_size = (0.10, 0.68, 0.10)
+            leg_size = (0.11, 0.75, 0.11)
+        elif zombie:
+            head_color, torso_color, arm_color, leg_color = "#7c9b54", "#477c91", "#6e914e", "#4b3e7d"
+            head_size = (0.46, 0.46, 0.46)
+            torso_size = (0.42, 0.60, 0.22)
+            arm_size = (0.16, 0.58, 0.16)
+            leg_size = (0.19, 0.75, 0.19)
+        else:
+            head_color, torso_color, arm_color, leg_color = "#c89d77", "#38679b", "#c89d77", "#34465e"
+            head_size = (0.50, 0.50, 0.50)
+            torso_size = (0.40, 0.60, 0.22)
+            arm_size = (0.15, 0.60, 0.15)
+            leg_size = (0.18, 0.75, 0.18)
+        return [
+            (0, 1.55, 0, *head_size, head_color),
+            (0, 1.05, 0, *torso_size, torso_color),
+            (-0.285, 1.05, 0, *arm_size, arm_color),
+            (0.285, 1.05, 0, *arm_size, arm_color),
+            (-0.105, 0.375, 0, *leg_size, leg_color),
+            (0.105, 0.375, 0, *leg_size, leg_color),
+        ]
+
+    def _draw_humanoid_model(
+        self,
+        canvas: tk.Canvas,
+        camera_position: tuple[float, float, float],
+        camera_rotation: tuple[float, float, float],
+        entity: dict[str, Any],
+        width: int,
+        height: int,
+    ) -> bool:
+        parts = self._humanoid_parts(str(entity.get("type", "")))
+        if parts is None:
+            return False
+        import math
+
+        yaw = math.radians(float(entity.get("yaw", 0)))
+        cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+        faces = (
+            ((0, 1, 3, 2), 0.78),
+            ((4, 6, 7, 5), 0.82),
+            ((0, 4, 5, 1), 0.62),
+            ((2, 3, 7, 6), 1.14),
+            ((0, 2, 6, 4), 0.92),
+            ((1, 5, 7, 3), 0.72),
+        )
+        polygons: list[tuple[float, list[float], str]] = []
+        for center_x, center_y, center_z, size_x, size_y, size_z, color in parts:
+            vertices: list[tuple[float, float, float] | None] = []
+            for sx, sy, sz in (
+                (-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
+                (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1),
+            ):
+                local_x = center_x + sx * size_x / 2
+                local_y = center_y + sy * size_y / 2
+                local_z = center_z + sz * size_z / 2
+                world = (
+                    float(entity["x"]) + cos_yaw * local_x - sin_yaw * local_z,
+                    float(entity["y"]) + local_y,
+                    float(entity["z"]) + sin_yaw * local_x + cos_yaw * local_z,
+                )
+                vertices.append(project_camera_point(camera_position, camera_rotation, world, width, height))
+            for indices, shade in faces:
+                face_vertices = [vertices[index] for index in indices]
+                if any(vertex is None or abs(vertex[0]) > width * 8 or abs(vertex[1]) > height * 8 for vertex in face_vertices):
+                    continue
+                depth = sum(vertex[2] for vertex in face_vertices if vertex is not None) / 4
+                points = [coordinate for vertex in face_vertices for coordinate in vertex[:2]]
+                rgb = tuple(int(color[i : i + 2], 16) for i in (1, 3, 5))
+                shaded = "#" + "".join(f"{max(0, min(255, round(channel * shade))):02x}" for channel in rgb)
+                polygons.append((depth, points, shaded))
+        for _depth, points, color in sorted(polygons, key=lambda polygon: polygon[0], reverse=True):
+            canvas.create_polygon(*points, fill=color, outline="#20232a", width=1)
+        return bool(polygons)
+
+    def _redraw_camera_preview(self) -> None:
+        canvas = self.preview_canvas
+        if canvas is None or not canvas.winfo_exists() or not self.preview_enabled.get():
+            return
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+
+        if self.data is None:
+            message = "Open a replay to preview its camera frame."
+            canvas.create_text(width / 2, height / 2 + 28, text=message, fill="#d0d7e2")
+            return
+        if self.preview_loading:
+            canvas.create_text(width / 2, height / 2 + 28, text="Indexing entities and rendering block frames…", fill="#d0d7e2")
+            return
+        if self.preview_error:
+            canvas.create_text(
+                width / 2,
+                height / 2 + 28,
+                text=f"Preview unavailable: {self.preview_error}",
+                fill="#f0a5a5",
+                width=max(200, width - 40),
+                justify="center",
+            )
+            return
+        camera = self._preview_camera()
+        if camera is None:
+            canvas.create_text(width / 2, height / 2 + 28, text="Select a position keyframe with camera data.", fill="#d0d7e2")
+            return
+        if not self.preview_data_loaded:
+            canvas.create_text(width / 2, height / 2 + 28, text="Preparing preview…", fill="#d0d7e2")
+            return
+
+        camera_position, camera_rotation, timestamp, target_key = camera
+        scene = self.preview_scenes.get(target_key)
+        if scene is not None:
+            try:
+                import base64
+
+                raw_rgb = base64.b64decode(scene["rgb"])
+                image_width, image_height = int(scene["width"]), int(scene["height"])
+                if len(raw_rgb) != image_width * image_height * 3:
+                    raise ValueError("Invalid block frame size")
+                source_image = tk.PhotoImage(width=image_width, height=image_height)
+                for row in range(image_height):
+                    start = row * image_width * 3
+                    colors = " ".join(
+                        f"#{raw_rgb[offset]:02x}{raw_rgb[offset + 1]:02x}{raw_rgb[offset + 2]:02x}"
+                        for offset in range(start, start + image_width * 3, 3)
+                    )
+                    source_image.put("{" + colors + "}", to=(0, row))
+                scale = max(1, min(width // int(scene["width"]), height // int(scene["height"])))
+                self.preview_photo = source_image.zoom(scale, scale) if scale > 1 else source_image
+                canvas.create_image(width / 2, height / 2, image=self.preview_photo)
+            except (KeyError, ValueError, tk.TclError):
+                self.preview_photo = None
+
+        visible_players = 0
+        visible_entities = 0
+        entities_to_draw: list[tuple[float, dict[str, Any], tuple[float, float]]] = []
+        for entity in self.preview_entities_by_frame.get(target_key, []):
+            is_player = entity.get("kind") == "player"
+            eye_offset = 0.9 if is_player else 0.45
+            world_position = (float(entity["x"]), float(entity["y"]) + eye_offset, float(entity["z"]))
+            projected = project_player(
+                camera_position,
+                camera_rotation,
+                world_position,
+                width,
+                height,
+            )
+            if projected is None:
+                continue
+            projected_point = project_camera_point(camera_position, camera_rotation, world_position, width, height)
+            depth = projected_point[2] if projected_point is not None else 0
+            entities_to_draw.append((depth, entity, projected))
+        for _depth, entity, (x, y) in sorted(entities_to_draw, key=lambda item: item[0], reverse=True):
+            is_player = entity.get("kind") == "player"
+            model_drawn = self.render_entity_models.get() and self._draw_humanoid_model(
+                canvas, camera_position, camera_rotation, entity, width, height
+            )
+            if not model_drawn:
+                color = "#68d6ff" if is_player else "#ffbd69"
+                canvas.create_oval(x - 5, y - 5, x + 5, y + 5, fill=color, outline="#f7f7f7", width=1)
+            name = str(entity.get("name") or entity.get("type") or "Entity")
+            canvas.create_text(x + 9, y, anchor="w", text=name, fill="#e3f8ff", font=("Segoe UI", 9, "bold"))
+            if is_player:
+                visible_players += 1
+            else:
+                visible_entities += 1
+        canvas.create_rectangle(1, 1, width - 1, height - 1, outline="#687484")
+        canvas.create_line(width / 2 - 8, height / 2, width / 2 + 8, height / 2, fill="#536171")
+        canvas.create_line(width / 2, height / 2 - 8, width / 2, height / 2 + 8, fill="#536171")
+        canvas.create_text(
+            10,
+            10,
+            anchor="nw",
+            text=f"{self._format_time(timestamp)}  ·  {visible_players} players  ·  {visible_entities} entities  ·  FOV 70°",
+            fill="#d0d7e2",
+            font=("Segoe UI", 9),
+        )
 
     def _draw_replay(self) -> None:
         canvas = self.replay_canvas

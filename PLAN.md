@@ -32,11 +32,22 @@ Create a standalone Python GUI for inspecting, repairing, and saving ReplayMod t
    - Find and highlight the first Time Keyframe whose replay timestamp is earlier than its predecessor.
    - Set bulk range endpoints by choosing Select Start / Select End and clicking keyframe markers, then shift, scale, or delete the inclusive range. Scaling supports start, midpoint, or end pivots. Bulk position operations do not change replay timestamps.
 
-5. **Verification**
+5. **Optional camera preview**
+   - Provide a checkbox that opens/closes a separate camera-preview window.
+   - Decode entity spawn, movement, teleport, and removal packets and reconstruct nearby block state from chunk and block-change packets in supplied Minecraft 1.21 (protocol 767) ReplayMod recordings.
+   - Track entity state while scanning, then retain only entities visible at requested keyframes; render low-resolution block-face frames in a background worker and cache by replay and camera-track identity.
+   - Project player and entity markers into the selected camera frame using a 70-degree FOV, and raycast block faces into a flat-shaded image.
+   - Ignore common visual clutter, prefer player/custom entity names to type labels, and hide entities blocked by raycasted blocks.
+   - Add a preview checkbox for simple projected player, zombie, and skeleton models, with markers remaining for other types.
+   - Use Node.js `minecraft-protocol` and `prismarine-chunk` for version-specific packet and chunk decoding. Blocks use simplified colors/cube shapes rather than textures or detailed models.
+
+6. **Verification**
    - Check Python syntax and run core checks against the supplied `timelines.json` example.
    - Confirm edits survive JSON serialization and that archive saving retains all entries other than the replaced `timelines.json`.
 
 ## Files
 
 - `replay_fixer.py` — application and timeline editing logic.
+- `replay_preview.py` / `replay_preview.js` — cached player event index and Minecraft 1.21 replay packet decoder.
+- `package.json` / `package-lock.json` — pinned Node.js decoder dependencies for the optional preview.
 - `PLAN.md` — this implementation plan.

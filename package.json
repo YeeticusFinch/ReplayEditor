@@ -1,0 +1,11 @@
+{
+  "name": "replay-fixer-preview-decoder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minecraft 1.21 replay packet decoder for the ReplayMod Timeline Fixer camera preview",
+  "dependencies": {
+    "minecraft-protocol": "1.68.0",
+    "prismarine-chunk": "1.41.0",
+    "yauzl": "3.4.0"
+  }
+}
